@@ -2,6 +2,8 @@ import type { CompanionActionDefinition, DropdownChoice, SomeCompanionActionInpu
 import type ModuleInstance from './main.js'
 import { Sequoia4K60LAdapter } from './adapters/index.js'
 import { RESOLUTION_MODES } from './resolutions.js'
+import { formatSignal } from './signal.js'
+import { formatFirmware } from './device-info.js'
 import {
 	ASPECT_CHOICES,
 	FULLSCREEN_CHOICES,
@@ -14,6 +16,7 @@ import {
 import {
 	ACTIVE_BORDER_CHOICES,
 	ALERT_DISPLAY_CHOICES,
+	CustomPresetChoices,
 	AUTO_HIDE_LABEL_CHOICES,
 	BORDER_WIDTH_CHOICES,
 	DEFAULT_LAYOUT_CHOICES,
@@ -236,6 +239,40 @@ const LABEL_CHARSET_TOOLTIP = 'Allowed characters exclude: < > ! @ # $ % ^ & * "
 
 /** Table 1.3.1.7/1.3.1.9. The device rejects a name outside this set with "Wrong format". */
 const PRESET_NAME_TOOLTIP = 'Allowed characters: A-Z, a-z, 0-9, period, dash and underscore.'
+
+/**
+ * The same rule as `PRESET_NAME_TOOLTIP`, for the `allowCustom` half of the preset pickers. It
+ * catches a mistyped name in the UI instead of letting the device answer "Wrong format" at press
+ * time - which matters most for Delete, where the request is not undoable.
+ */
+const PRESET_NAME_REGEX = '/^[A-Za-z0-9._-]+$/'
+
+/**
+ * Shared by the Load and Delete preset pickers.
+ *
+ * A dropdown of the names the device reported (Table 1.3.1.8, newest first), plus `allowCustom` so
+ * a name can still be typed. Both halves are needed: the list is only as fresh as the last refresh,
+ * and a preset saved on the unit since then would otherwise be unreachable. It is also what keeps
+ * the field usable on a unit with nothing saved, where the choice list is legitimately empty.
+ *
+ * `preselect` is false for Delete. Load defaults to the newest preset because that is a convenience
+ * and a wrong guess costs a reload; Delete starts blank so that an action added to a button and not
+ * yet configured is not already pointing at a real preset. An empty name is refused by the device,
+ * which makes an unconfigured Delete a no-op rather than a deletion of whatever happened to be
+ * first in the list.
+ */
+function PresetNameField(names: string[], tooltip: string, preselect: boolean): SomeCompanionActionInputField<'name'> {
+	return {
+		id: 'name',
+		type: 'dropdown',
+		label: 'Preset Filename',
+		default: preselect ? (names[0] ?? '') : '',
+		choices: CustomPresetChoices(names),
+		allowCustom: true,
+		regex: PRESET_NAME_REGEX,
+		tooltip,
+	}
+}
 
 export function UpdateActions(self: ModuleInstance): void {
 	const mode = self.config.mode
@@ -488,8 +525,11 @@ export function UpdateActions(self: ModuleInstance): void {
 
 	// --- Section 1.3.2, Commands for Controlling Window ---------------------------------------
 	// Documented for both models with one request shape, so these are plain `self.adapter` calls
-	// with no `instanceof` narrowing. Section 1.3.5 lists none of them, so daisy-chain mode is
-	// assumed not to accept them and they are left unregistered there.
+	// with no `instanceof` narrowing. Section 1.3.5 lists none of them, and hardware agrees: on a
+	// daisy-chained 4K60L almost every one returns `Success` and does nothing (2026-07-29), while
+	// the same seven work correctly on the same model in quad-bypass (2026-08-19). So the
+	// restriction is specific to daisy chain rather than a general doubt about 1.3.2, and they are
+	// left unregistered there.
 	const supportsWindowCommands = !isDaisyChain
 
 	const get_window_geometry: CompanionActionDefinition<ActionsSchema['get_window_geometry']['options']> | undefined =
@@ -629,11 +669,12 @@ export function UpdateActions(self: ModuleInstance): void {
 		supportsSystemCommands
 			? {
 					name: 'Refresh Firmware Version',
+					description:
+						'Updates the firmware version and machine identity variables. These are also read whenever the connection is established, and they do not change while the unit is running, so this is rarely needed.',
 					options: [],
 					callback: async () => {
 						try {
-							const result = await self.adapter.getFirmwareVersion()
-							self.log('info', `Firmware version: ${JSON.stringify(result)}`)
+							self.log('info', `Firmware version: ${formatFirmware(await self.refreshDeviceInfo())}`)
 						} catch (error) {
 							self.log('error', `Refresh Firmware Version failed: ${(error as Error).message}`)
 						}
@@ -645,11 +686,13 @@ export function UpdateActions(self: ModuleInstance): void {
 		supportsSystemCommands
 			? {
 					name: 'Refresh Input Signal Status',
+					description:
+						'Updates the input signal variables and feedbacks immediately. Only needed if the poll interval is long or polling is disabled.',
 					options: [],
 					callback: async () => {
 						try {
-							const result = await self.adapter.getSignalType()
-							self.log('info', `Input signal status: ${JSON.stringify(result)}`)
+							const signals = await self.refreshSignalState()
+							self.log('info', `Input signal status: ${signals.map(formatSignal).join(' | ')}`)
 						} catch (error) {
 							self.log('error', `Refresh Input Signal Status failed: ${(error as Error).message}`)
 						}
@@ -732,13 +775,11 @@ export function UpdateActions(self: ModuleInstance): void {
 			? {
 					name: 'Load Custom Preset',
 					options: [
-						{
-							id: 'name',
-							type: 'textinput',
-							label: 'Preset Filename',
-							default: '',
-							tooltip: PRESET_NAME_TOOLTIP,
-						},
+						PresetNameField(
+							self.customPresets,
+							`Pick a preset the device reported, or type a name. ${PRESET_NAME_TOOLTIP}`,
+							true,
+						),
 					],
 					callback: async (event) => {
 						try {
@@ -754,14 +795,19 @@ export function UpdateActions(self: ModuleInstance): void {
 		supportsSystemCommands
 			? {
 					name: 'Refresh Custom Preset List',
+					description:
+						'Re-reads the presets saved on the device and repopulates the Load and Delete pickers. Press after saving or deleting a preset from the units own GUI.',
 					options: [],
 					callback: async () => {
-						try {
-							const result = await self.adapter.listCustomPresets()
-							self.log('info', `Custom presets: ${JSON.stringify(result)}`)
-						} catch (error) {
-							self.log('error', `Refresh Custom Preset List failed: ${(error as Error).message}`)
-						}
+						// refreshCustomPresets() rebuilds the action definitions, which is the whole
+						// point of the press - the pickers' choices are fixed when they are defined.
+						await self.refreshCustomPresets()
+						self.log(
+							'info',
+							self.customPresets.length
+								? `Custom presets: ${self.customPresets.join(', ')}`
+								: 'Custom presets: none saved on the device',
+						)
 					},
 				}
 			: undefined
@@ -771,13 +817,11 @@ export function UpdateActions(self: ModuleInstance): void {
 			? {
 					name: 'Delete Custom Preset (cannot be undone)',
 					options: [
-						{
-							id: 'name',
-							type: 'textinput',
-							label: 'Preset Filename',
-							default: '',
-							tooltip: `Permanently deletes this preset from the device. ${PRESET_NAME_TOOLTIP}`,
-						},
+						PresetNameField(
+							self.customPresets,
+							`Permanently deletes this preset from the device. Picking from the list avoids a typo deleting the wrong one. ${PRESET_NAME_TOOLTIP}`,
+							false,
+						),
 					],
 					callback: async (event) => {
 						try {

@@ -50,7 +50,33 @@ Two things make it trustworthy, and both are worth preserving:
   `file://` could fire commands but never read the reply. The local server exists to read it.
 
 Its `COMMANDS` array is declarative — extending the bench to another guide section is a data
-change, not a rewrite. It currently covers sections 1.3.1 and 1.3.2.
+change, not a rewrite. It covers every adapter method: sections 1.3.1 through 1.3.5.
+
+Sections 1.3.3–1.3.5 are the first commands that are not on every unit, so entries carry optional
+`models` and `modes` lists. An inapplicable command is rendered **disabled with the reason** rather
+than hidden, so the page stays a full catalogue of the guide and "why is this not here" is answered
+on the card. `unavailableReason()` is enforced in `handleSend()` too, not only in the markup —
+`setKmRebootMode` and `setLabel` exist only on `Sequoia4K60LAdapter`, and reaching one through a
+4K60 adapter is a `TypeError` that reads like a bench fault rather than a wrong question.
+
+This is applicability, **not** the mode gating `actions.ts` performs. The bench still fires anything
+the running adapter can physically send — that is the point of it — so a command Companion withholds
+from a mode is still offered here when the adapter has a branch for it.
+
+Two consequences of driving the real adapters worth knowing before reading a result:
+
+- **Routing — Set sends nothing at all in daisy-chain mode.** §1.3.5 has no routing command, so
+  `Sequoia4K60LAdapter.setRouting()` has no branch for that mode and falls through silently. The
+  result panel reports "no request was made", which is the honest answer, but it is not a device
+  response and must not be read as one.
+- **One card, several wire shapes.** `set_audio_4k60l` sends `2060`/`audio` with `location` for
+  quad-bypass OUT 2/3, without it for single-view, and switches to the `Daisy` cmd family entirely
+  in daisy-chain mode. `set_routing_4k60l` similarly splits between `route2win` and `hdmi_output`.
+  Read the URL the bench prints rather than assuming which branch ran.
+
+Tables 1.3.4.6 and 1.3.4.9/1.3.4.10 have no cards of their own: §1.3.1 documents K/M Control and
+Output Resolution for the 4K60 in the same shape, so there is one adapter method each and firing
+the 1.3.1.13 / 1.3.1.4 cards on a 4K60L _is_ firing them. Same for 1.3.5.3 and 1.3.5.4.
 
 Two things the bench does that Companion does not:
 
@@ -64,6 +90,51 @@ Two things the bench does that Companion does not:
   Delete (§1.3.1.9) erase device state in every mode, and the bench fires on a single click with no
   confirmation. Unlike Companion — where a button has to be deliberately created and the action
   assigned to it — one click on the bench page is the whole gesture.
+
+### Testing in a real Companion (`yarn deploy`)
+
+The bench proves a _command_ works; only Companion proves the _module_ works. Companion loads
+"developer modules" from a folder configured in its launcher settings, one subfolder per module.
+
+```bash
+yarn deploy --to /mnt/c/Testing/development/companion-module-avitech-sequoia4k60-sequoia4k60l
+```
+
+`yarn deploy` builds first, then rsyncs. **It must build first** — Companion runs `dist/main.js` per
+the manifest entrypoint and never looks at the TypeScript, so deploying a stale `dist/` is the most
+likely way to be confused by this script. The folder name is free; Companion identifies a module by
+the `id` in its `companion/manifest.json`, not by the directory.
+
+**Why a copy and not a symlink.** Companion runs on Windows here, the repo lives on WSL2's ext4, and
+nothing bridges them:
+
+- Windows refuses `mklink /D` to a UNC target, so there is no Windows-side link into WSL.
+- Pointing the dev-modules path straight at `\\wsl.localhost\...` fails on **Companion 5.0.1**,
+  whose loader builds the import URL by string concatenation:
+
+  ```js
+  var DI = (e) => (process.platform === 'win32' && !e.startsWith('file://') ? `file://${e}` : e)
+  ```
+
+  A drive path limps through that; a UNC path becomes `file://\\host\share\...`, not a valid
+  absolute file URL. The module dies with `ERR_INVALID_FILE_URL_PATH` during registration, which
+  Companion surfaces as **"Failed to init: Error: Call timed out"** — a message that points at the
+  module's `init()` and is entirely misleading. `pathToFileURL(e).href` handles both forms. If that
+  is fixed upstream this script stops being necessary.
+
+Windows Node _can_ otherwise read and import across the WSL share — that was measured, not assumed —
+so the loader's URL handling is the whole obstacle.
+
+Two consequences of it being a copy:
+
+- **No hot reload.** WSL2's inotify events do not reach Windows file watchers, so Companion cannot
+  notice a rebuild. Run `yarn deploy`, then restart the connection in Companion.
+- **The first copy is slow** — ~87MB of `node_modules` over DrvFs. Later ones move only the changed
+  files in `dist/`, which is why this is rsync rather than a plain copy.
+
+`tools/deploy.mjs` runs rsync with `--delete`, so a mistyped destination would empty a directory
+rather than merely add to one. It refuses an unset target, `/`, a target whose parent does not exist,
+and the repo itself. Keep those checks.
 
 ## Model / mode design
 
@@ -141,38 +212,350 @@ justified rather than precautionary:
   §1.3.2 command with a known harmful effect in this mode. Companion won't offer it there, but
   `tools/bench.mjs` does not gate by mode and will happily fire it.
 
-**§1.3.1 is almost entirely un-bench-tested.** Every request shape in it was verified against the
-guide's worked examples and nothing more. That is a weaker claim than it sounds — the §1.3.2
-findings above were also guide-faithful right up until hardware showed that `z` and `global_option`
-behave nothing like the documentation says.
+## What hardware has actually confirmed
 
-The one exception, tested on a 4K60L on 2026-07-29: **Reset Factory Defaults (§1.3.1.11) does not
-apply when sent.** The unit carries on with its presets and full command set intact, and the reset
-only lands on the next reboot. So the destructive window closes at the power cut, not at the button
-press, and a unit that has been sent this looks completely normal until someone reboots it. Warnings
-in `base.ts`, `actions.ts` and `bench.mjs` say "destructive" without saying "immediate" for exactly
+This module's history is that guide-faithful and correct are different claims — the §1.3.2 findings
+above were guide-faithful right up until hardware showed that `z` and `global_option` behave nothing
+like the documentation says. So what follows tracks the difference deliberately. **Do not upgrade a
+claim here without re-testing; do not quietly downgrade one either.**
+
+**Bench-tested on a 4K60L in Quad Multiview + Bypass mode, 2026-08-19: every command the bench
+offers in that mode succeeds and behaves as documented.** That is all of §1.3.1, all of §1.3.2, and
+§1.3.4's routing, routing-info, audio and power-on K/M mode — 37 of the bench's 41 cards. The four
+it withholds there are the 4K60-only §1.3.3 trio and the daisy-chain-only Label Text.
+
+Four things that were open assumptions and are now settled, all confirmed on that unit:
+
+- **`setOsd` is additive.** An unaddressed key is left alone, so the task-shaped actions in
+  `actions.ts` really can each write only their own keys without disturbing another's. This was the
+  module's biggest untested assumption — `setWindowGeometry` had to abandon exactly the same one.
+- **The destructive commands do what they claim.** Reset Factory Defaults (§1.3.1.11) and Custom
+  Preset — Delete (§1.3.1.9) both land. See the reboot caveat below, which is unchanged.
+- **`idle_time` (§1.3.1.24) is in seconds.** The guide's Cmd-Value row is blank — no range, no
+  units, no disable value — and seconds was inferred from a single example (120 described as "2
+  minutes"). The inference was right. The 0–65535 bound in `actions.ts` is still this module's
+  invention rather than a vendor-stated limit.
+- **§1.3.1.23's `enable` really is inverted.** `0` turns power saving **on**. The guide's wording is
+  not a transcription error.
+
+Still standing, tested on a 4K60L on 2026-07-29: **Reset Factory Defaults does not apply when
+sent.** The unit carries on with its presets and full command set intact, and the reset only lands
+on the next reboot. The destructive window closes at the power cut, not at the button press, so a
+unit that has been sent this looks completely normal until someone reboots it. Warnings in
+`base.ts`, `actions.ts` and `bench.mjs` say "destructive" without saying "immediate" for exactly
 this reason — do not re-tighten that wording without re-testing.
 
-Specific things to establish on real hardware before trusting them:
+Note what the quad-bypass pass does to the daisy-chain findings: **§1.3.2 is not broken in general,
+it is broken in daisy chain.** The same seven commands that return `Success` and do nothing on a
+chained unit work correctly on the same model in quad-bypass. That makes the `!isDaisyChain` gating
+mode-specific rather than a blanket doubt about §1.3.2, and it is now the stronger reading of the
+2026-07-29 results.
 
-- The `get` responses (firmware, signal type, network, OSD info, custom preset list) are all
-  screenshot-only in the guide, so no captured shape is recorded for any of them. Signal Type
-  (§1.3.1.2) is the one worth capturing first — it is live per-window state and the only §1.3.1 read
-  worth driving feedbacks from.
-- Whether `setOsd` really is additive. The module assumes an unaddressed key is left alone, because
-  every worked example sends a partial `data` object. `setWindowGeometry` had to abandon exactly
-  that assumption. `getOsdInfo` is the read side to build on if it turns out to be wrong.
-- `idle_time` (§1.3.1.24) has a **blank** Cmd-Value row in the guide — no range, no units, no
-  disable value. Seconds is inferred from its single example (120 described as "2 minutes"); the
-  0–65535 bound in `actions.ts` is this module's invention, not the vendor's.
+### Not yet established
 
-Three places where the guide's prose and its worked example disagree, and the example was followed:
-`en` vs `enable` (§1.3.1.15), `mode` vs `sob_alarm` (§1.3.1.22), and `preset_num` vs `preset_unm`
-(§1.3.1.6). Also note §1.3.1.23's `enable` is inverted — `0` turns power saving **on** — which is
-the guide's wording, not a transcription error.
+- **The 4K60 is entirely untested.** No hardware has run §1.3.3, and the §1.3.1/§1.3.2 pass above
+  proves nothing about it — the guide claims those sections cover both models, but that claim is
+  exactly the kind this project has already seen fail. Port 5 (4K60-only, §1.3.1.4) is unexercised.
+- **The 4K60L's other two modes.** Single-View Seamless has never been on a bench at all.
+  Daisy chain has, with the negative results above.
+- Network and OSD Info were recovered from the guide's figures as images (`pdfimages -png -f <page>`)
+  rather than from hardware — see below. **Signal Type (§1.3.1.2), Custom Preset File List
+  (§1.3.1.8) and Firmware Version (§1.3.1.1) are captured from hardware and implemented.**
+
+### Firmware Version (§1.3.1.1), captured 2026-08-24
+
+Bench-captured from a 4K60L and cross-checked against the guide's Figure 1.3.1.1 (a 4K60, recovered
+with `pdfimages -png -f 9`). Both payloads are transcribed in full in `src/device-info.ts`.
+
+**Every key the figure shows is present on hardware with the same spelling, the same type and the
+same array length.** This is one of the few shapes in this module where the guide was exactly right
+about what it documented — worth recording precisely because the §1.3.2 findings set the opposite
+expectation.
+
+Where it was wrong is completeness: **hardware returns 51 keys to the figure's 32**, a strict
+superset. The extra 19 are `fan_status`, `ws_total_user`, `ttf`, `daisy_startup_flag`, `daisy_dip`,
+`daisy_slave_mode`, `remote_winid[5]`, `remote_mouse_mode[5]`, `gateway`, `subnet`, `ip_dev_bundle`,
+`ip_dev_bundle_ip`, `oip_ver`, `DH_MASTER`, `ip`, `remote_manager_en`, `change_template`,
+`inp_bit[4]` and `scaler_menu[2]`. **Do not attribute those to either model or firmware** — the two
+units differ on both axes (4K60 on 2022–2024 firmware vs 4K60L on 2026 firmware), so the capture
+cannot separate them.
+
+Four things it settles:
+
+- **A ninth version string exists.** `oip_ver` (`"2025.6.2.15"`) appears nowhere in the guide. It is
+  now a `firmware_oip` variable, blank on a unit that does not report it.
+- **`temp` is a string** (`"34"`, `"45"`), where a number would be expected.
+- **`fading_time` is an array of one** (`[0]`), not a scalar.
+- **The five-wide port arrays are not a 4K60 thing.** `resolution`, `remote_en`, `osd_en`, `audio`
+  and `auto_remote` are five entries long on the **4K60L** too, which has only four HDMI outputs —
+  and `remote_en` came back `[1,1,1,0,1]`, so the fifth slot is not inert padding either. This
+  corrects an earlier guess here that the figure's five entries were explained by it being a 4K60.
+  Anything that later maps these arrays onto ports must not size itself from `capabilities.maxPorts`
+  — the same trap `INPUT_IDS` exists to avoid in `signal.ts`.
+
+**The rest of the payload is live state with no other read path**: the port arrays above, plus
+`sib_hdcp[4]`, `custom_edid[4]`, `force_source_color[4]`, `inp_bit[4]`, `daisy_*`, `idle_time`,
+`fading_time`, `temp`, `fan_status`, `usage_time`, `sob_alive`, `scaler_alive`, `sob_alarm`,
+`wall_lock_status`, `avahi_ip`, `ip`, `gateway`, `subnet`, `udp_port`. That is the next wave of
+variables and the harder half: unlike the version strings it _changes_, so it needs a refresh story
+rather than the read-once one. Two leads for it — Table 1.3.1.1's Function row says "Reference:
+resolution code corresponding table", so `resolution[]` carries the same codes `RESOLUTION_MODES`
+uses for `setOutputResolution`; and `ip`/`gateway`/`subnet` are network facts about _this_ unit,
+which §1.3.1.3 notably cannot give you (it returns every Sequoia on the subnet).
+
+### Custom Preset File List (§1.3.1.8), captured 2026-08-19
+
+The last `get` whose response shape was unrecorded anywhere. Captured from a 4K60L across three
+reads, with presets saved between them:
+
+```
+[]                                     no presets saved
+["TestPreset"]                         after saving TestPreset
+["TestPreset2","TestPreset"]           after then saving TestPreset2
+["Alpha","TestPreset2","TestPreset"]   after then saving Alpha
+```
+
+- **Elements are bare filename strings**, not objects, and carry **no extension**. So a name from
+  this list feeds straight into `loadCustomPreset()` and `deleteCustomPreset()` with no
+  transformation — the list output and the load/delete input are the same strings. That is what
+  makes the pickers below possible; without it the list would need a name-extraction step that
+  could drift from what the load/delete commands accept.
+- **The empty case is an ordinary `[]`** — not `""`, not `"Success"`, not a `cb_status` rejection.
+  It needs no special handling and is not an error. `parseResponse` returns it intact: the
+  `cb_status` check is guarded by `!Array.isArray(parsed)`, so an array falls straight through.
+- **The order is newest-first**, and element 0 _is_ the most recently saved preset. Establishing
+  that took a deliberately discriminating test: the first two reads were consistent with both
+  newest-first and descending-alphabetical, because `TestPreset2` was simultaneously the newer file
+  and the later string. Saving `Alpha` last separates them — it came back first, which
+  descending-alphabetical cannot produce. The order is preserved rather than sorted in
+  `parseCustomPresetList()`, so the newest preset stays at the top of the pickers.
+
+Four places where the guide's prose and its worked example disagree, and the example was followed:
+`en` vs `enable` (§1.3.1.15), `mode` vs `sob_alarm` (§1.3.1.22), `preset_num` vs `preset_unm`
+(§1.3.1.6), and `signal` (§1.3.1.2, below). The quad-bypass pass confirms the example was the right
+choice in each case.
+
+### The custom preset pickers
+
+Load Custom Preset (§1.3.1.7) and Delete Custom Preset (§1.3.1.9) take a **dropdown of the names
+the device reported**, built by `PresetNameField()` in `actions.ts` from `ModuleInstance.customPresets`.
+
+- **`allowCustom` is on, and both halves are load-bearing.** The list is only as fresh as the last
+  refresh, so a preset saved on the unit since then would otherwise be unreachable; and a unit with
+  nothing saved has a legitimately empty choice list, which without a typed fallback would be a
+  dead control. The `regex` catches a mistyped name in the UI rather than letting the device answer
+  `Wrong format` at press time.
+- **`customPresets` is not polled.** Presets change only when someone saves or deletes one, so it is
+  read in `init()` and `configUpdated()` and on demand from the "Refresh Custom Preset List" action.
+  That action exists to rebuild the pickers — a dropdown's choices are fixed when the action is
+  defined, so `refreshCustomPresets()` calls `updateActions()`.
+- **Empty is a real value, not a "not loaded" marker.** A unit with no presets returns `[]`, so
+  nothing may treat an empty list as a failed read.
+- **`refreshCustomPresets()` never throws.** It runs during `init()`, where an unreachable device
+  must still leave a working instance — the pickers fall back to typed names, which is what they
+  were before they had a list. `checkConnection()` has already reported connection state, so a
+  failure is logged at `debug` rather than raised twice.
+- **Delete starts blank; Load pre-selects the newest preset.** Load is a convenience where a wrong
+  guess costs a reload. Delete is not undoable, so an action added to a button and not yet
+  configured must not already point at a real preset — and the device refuses an empty name, which
+  makes an unconfigured Delete a no-op.
 
 `ModuleInstance.adapter` is rebuilt in both `init()` and `configUpdated()`, because changing the
 configured mode must swap the adapter and rebuild the action list.
+
+## Signal Type (§1.3.1.2) and the poll loop
+
+`src/signal.ts` parses the only §1.3.1 read that reports live state. Captured from a 4K60L on
+2026-08-12 and cross-checked against the guide's Figure 1.3.1.2; the module's variables and the
+`input_signal_present` feedback are built on it.
+
+```json
+[{"input":1,"signal":19,"clock":5939,"total":[4400,2250],"active":[3840,2160],"start":[384,82],"freq":6000},
+ {"input":2,"signal":0}, ...]
+```
+
+- **An input with no signal carries only `input` and `signal`.** Every other key is absent. The
+  guide's figure has all four inputs live and so never shows this, which is why `parseSignalResponse`
+  never infers one key's presence from another's.
+- **`signal` is not `0`/`1`.** The prose says `0(video absent) / 1(video feed)`; the figure shows 3
+  and 5, hardware returned 19. Nor is it a resolution code — the figure's `3` and the captured `19`
+  are both 3840×2160@60 differing only in blanking — and it shares no namespace with
+  `RESOLUTION_MODES` (where 3840×2160 60Hz is 99). Treat it as opaque; only `!== 0` is relied on,
+  and the readable format comes from `active` + `freq`.
+- **`freq` is hundredths of a Hz** (6000 = 60.00, 5994 = 59.94, 2997 = 29.97). **`clock` is a
+  measured pixel clock in units of 0.1 MHz** — every sample checks out against
+  `total[0] × total[1] × freq`. It **jitters**: two inputs carrying an identical format read 5939
+  and 5940. Neither `clock` nor `start` is surfaced as a variable, and neither should be — polling
+  measurement noise onto a button redraws it for nothing.
+- **`input` is 1–4 on both models.** `capabilities.maxPorts` counts HDMI _outputs_ (5 on the 4K60)
+  and must not be used to size this array; `INPUT_IDS` is separate for that reason.
+
+`ModuleInstance` polls this on a timer whose interval is the `pollInterval` config field (seconds,
+`0` disables). **One tick is two reads** — Signal Type and Firmware Version — awaited in sequence,
+not with `Promise.all`: this is a small embedded web server on untested firmware, and two concurrent
+cgi-bin requests per tick is a load pattern nothing has established it handles. One interval drives
+both; a field per read would ask the user to tune something they cannot reason about. Three
+properties to preserve:
+
+- **It does not poll in daisy-chain mode.** §1.3.5 lists neither command, so polling them would be
+  exactly the request the `actions.ts` gating exists to prevent — and §1.3.2's bench results are
+  the warning about what a chained unit's answer is worth. Note this is **narrower than the rule
+  `checkConnection()` follows**, deliberately: that sends Firmware Version once per connect in every
+  mode, because a reachability check has to work everywhere and one request is not a pattern.
+  Repeating it on a timer is. So the health variables and feedbacks simply do not update on a
+  chained unit, and every feedback description says so.
+- **`stopPolling()` runs in `destroy()` and at the top of `configUpdated()`.** Host, interval and
+  mode can all change, so the loop is torn down and rebuilt rather than adjusted.
+- **Failures log once, not every tick.** `pollFailing` tracks the transition; an unreachable device
+  would otherwise fill the log at the poll rate. The request has already set `InstanceStatus`.
+
+The "Refresh Input Signal Status" action calls `refreshSignalState()` — the same path the poll uses
+— so a manual press and a tick publish identically.
+
+### Firmware version variables (§1.3.1.1)
+
+`src/device-info.ts` parses Table 1.3.1.1's reply into the nine `firmware_*` variables plus
+`machine_name`, `machine_type` and `mac_address`. **The shape is bench-confirmed on a 4K60L** — see
+the capture above. The 4K60 has still never answered this command for us, so its reply is known only
+from the figure; the parser treats every field as optional, which is what makes that gap harmless.
+
+- **Read once per connect, never polled.** Stronger than the `customPresets` argument: these strings
+  cannot change while the unit is running. They are refreshed wherever the module already sends this
+  command, plus on demand from "Refresh Firmware Version".
+- **`checkConnection()` parses the reply it used to discard.** No new request — this is the same
+  command the module has always sent to prove the unit is reachable. That is what keeps it clear of
+  §1.3.5's closed list: reading a reply already in hand is not the same act as sending a command the
+  guide does not list for daisy chain. The firmware variables are therefore populated in every mode,
+  including daisy chain, where the values are as trustworthy as the connection check itself.
+- **A failed connect clears them** rather than leaving them. After a host change the previous values
+  describe a different machine.
+- **Every field is optional in the parser** and a non-object reply degrades to blanks. Figure 1.2.6
+  documents `null` and `{ }` as real answers when there is no data, so an empty object is a shape
+  the device produces and not a malformed reply.
+- **`formatFirmware()` skips the blanks**, so "this firmware does not report `mediator_ver`" stays
+  visible in the log instead of flattening into an empty value that reads like a parse bug.
+- `device-info.ts` imports **only types** from `avitech-api.ts`, so it stays out of the bench's
+  forbidden dependency chain.
+
+### Device health polling, bench-tested 2026-08-26
+
+Run against the 4K60L at 192.168.0.7 in **Quad Multiview + Bypass**, ~10 minutes at the default
+2-second interval, in a real Companion 5.0.1. Variables and feedbacks updated throughout.
+
+- **The doubled request rate is fine.** A tick is now two cgi-bin GETs rather than one, so at the
+  default interval the unit fields a request per second. This was the main open risk in adding
+  §1.3.1.1 to the poll loop — an embedded web server on firmware that is not regression tested — and
+  it held for the duration with no errors and no `Device polling failed` transition.
+- **§1.3.1.1 works as a _polled_ read, not only a connect-time one.** The guide documents the command
+  without saying anything about repeat calls, so this was an assumption until now.
+- **The health fields barely move.** Sampled directly every 20 seconds for 7 minutes, `temp`,
+  `fan_status`, `sob_alive`, `scaler_alive`, `wall_lock_status` and `usage_time` were all constant;
+  `temp` shifted by one degree over two _days_. Only `scaler_alive` differed between captures at all.
+  Polling this at the same 2-second rate as the signal read is therefore mostly wasted requests, and
+  that measurement is what the split cadence below is built on.
+
+#### The split cadence (2026-08-31)
+
+The device-info read no longer rides every tick. `deviceInfoEveryTicks()` in `config.ts` derives a
+tick count from the configured interval and `DEVICE_INFO_REFRESH_SECONDS` (30), so at the default
+2-second interval §1.3.1.2 is read every tick and §1.3.1.1 every fifteenth — taking the sustained
+rate from ~1 req/s back to ~0.53. Four properties to preserve:
+
+- **One timer, not two.** The device-info read counts ticks on the signal loop rather than getting
+  a `setInterval` of its own, because two timers can fire together and the module's standing rule is
+  that two cgi-bin requests are never in flight at once. `pollInFlight` only guards one loop.
+- **30 seconds is a target, not a bound.** `deviceInfoEveryTicks()` rounds up, so the period lands
+  at or above the target and overshoots by up to one interval — a 20-second poll interval gives a
+  40-second device-info period, since a read can only ride a tick that exists.
+- **The counter is reset by `refreshDeviceInfo()` itself**, so it counts ticks since the response
+  was last read _by anyone_. A manual "Refresh Firmware Version" postpones the next polled read
+  rather than being followed by one moments later, and the reset lands before the request can fail,
+  which is what stops a unit that refuses §1.3.1.1 from being retried on every tick.
+- **`pollInterval` stays one field.** It is the signal read's interval; the fraction is the module's
+  to derive from its own measurements, not a second number for the user to reason about.
+
+**Bench-tested in a real Companion on 2026-08-31**, against the 4K60L in Quad Multiview + Bypass.
+The risk here was never the device — the 2026-08-26 pass proves the higher rate works and this only
+lowers it — but whether the health variables and feedbacks still update at the slower cadence, or
+quietly freeze. They update.
+
+- **The signal side is unmeasurably changed.** Input variables still follow a re-plug within the
+  configured interval, which is the control for the whole test.
+- **`device_alert_display` tracked the Alert Display action**, averaging ~10s to surface. That is
+  the shape a 30-second period produces: a change at an arbitrary moment lands uniformly across the
+  window, so the mean is what varies with sampling and the _bound_ is the property being checked.
+  This is the test worth repeating, because it is the only health field that can be changed on
+  demand — `temp` moved one degree in two days, so watching it proves nothing either way.
+- **The log shows the derived ratio directly**: 15 signal reads per device read at the default
+  2-second interval, and 2:1 after switching to 20 seconds. The second of those is the overshoot
+  path — 20s does not divide 30s, so the read lands every 40 seconds rather than every 30.
+- **`configUpdated()` rebuilds the cadence**, confirmed by that ratio changing on an interval edit
+  without a reconnect.
+- **Connect-time behaviour is unchanged**: the firmware variables populate immediately, from
+  `checkConnection()` rather than from the loop.
+
+### Device health variables and feedbacks
+
+The live half of §1.3.1.1 — the fields that change while a unit runs — drives `device_*` variables
+and three feedbacks. **The governing fact is that almost none of it is documented.** Of the eight
+fields, exactly one appears in the guide's text at all.
+
+- **`sob_alarm` is a _setting_, not an alarm.** §1.3.1.22 "Alert Display – Set" defines it as
+  `0 (off) / 1 (on)` for whether the unit displays fan-failure and temperature alerts. The captured
+  4K60L returned `1` — alerts switched on, a healthy configuration. It is modelled as
+  `health.alertDisplay` and surfaced as "Alert display setting" for exactly this reason: a feedback
+  reading it as "the device is alarming" would light on every correctly configured unit. Do not
+  rename it back. (The guide's own Table 1.3.1.22 caption says "Set Active Border Show/Hide
+  Command", which is a copy-paste error — the Function row is the accurate part.)
+- **`fan_status`, `sob_alive`, `scaler_alive`, `daisy_active`, `wall_lock_status` and `usage_time`
+  appear nowhere in the guide.** They were found by capturing the response. Their values are
+  visible; what a value _means_ is not known.
+
+  **`scaler_alive` is the proof that this caution is not theoretical.** It read `1` in the guide's
+  figure and in the 2026-08-24 capture, and `0` across 20 samples over 7 minutes on 2026-08-26 — the
+  same 4K60L, working normally in quad-bypass both times, with Companion driving it. A "Scaler not
+  alive" feedback would therefore have been firing continuously on a perfectly healthy machine.
+  Do not name these fields on the strength of what they are called.
+
+That is why there is no "Fan fault" feedback. Shipping one means guessing the polarity of
+`fan_status`, and the failure mode of guessing wrong is a button that stays green through an actual
+fan failure. Instead a single `device_status_field` feedback offers the six undocumented fields with
+a comparison and a value, so an operator who has watched their own unit can build the rule the module
+cannot justify. **Promote a field to its own named feedback when a bench result establishes what its
+values mean, not before** — the `documented` flag on `HEALTH_FIELDS` is the switch, and
+`HEALTH_COMPARISON_FIELDS` derives from it so both move in one edit.
+
+Two more properties worth keeping:
+
+- **Absent and zero must not collapse.** A field the unit does not report parses to `undefined` and
+  publishes as `''`, not `0` — on a button, blank reads as "the unit didn't say" where `0` reads as a
+  measurement it never made. The feedbacks return false on `undefined` for every comparison, so
+  "not equal to 0" cannot come out true because the device said nothing.
+- **`temp` arrives as a string** (`"34"`) while `fan_status` arrives as a number (`0`) **in the same
+  response**, so `toOptionalNumber` accepts both. It rejects everything else rather than coercing:
+  `Number('')` is `0`, and a silent zero in a temperature feedback is the kind of wrong that looks
+  right. The unit of measurement is not stated anywhere, which is why the threshold feedback takes
+  the number from the user instead of hard-coding one.
+
+`ip`, `gateway` and `subnet` come from the same read and are published too. They are worth having
+because §1.3.1.3 — the command actually named "Network Info" — _cannot_ tell you which unit you
+addressed: it returns every Sequoia on the subnet with no marker for the one you asked.
+
+### The `get` shapes still known only from the guide's figures
+
+Recovered by extracting the PDF figures as images rather than from hardware, so these are the
+guide's own screenshots — trustworthy about _shape_, not about any particular unit's values. Note
+what happened to the third member of this list: Figure 1.3.1.1 was decoded the same way and then
+bench-checked, and the guide turned out to be exactly right about the keys it showed and to be
+missing 19 of the 51 the device actually sends. Read these two as a floor, not a full list.
+
+- **Network** (`Info`/`machinelist`, Figure 1.3.1.3) — an array of
+  `{IP, MAC, MACHINE, NAME, AVAHI_IP}`, keys uppercase. Note it lists **every** Sequoia on the
+  subnet, not just the addressed one, so nothing may assume element 0 is this instance.
+- **OSD Info** (`2060`/`get`/`osd`, Figure 1.3.1.14) — confirms all 15 `OsdSettings` keys the module
+  writes, spelled identically, colours as `[r,g,b,a]`. It also returns `show_tally2`, `show_tally3`,
+  `tally2_on_color`, `tally2_off_color` and `tally3_off_color`, which `OsdSettings` does not model —
+  tally channels 2 and 3 are unimplemented, not deliberately excluded.
 
 ## Device HTTP API
 
@@ -211,6 +594,17 @@ Anything else that parses as JSON is returned parsed; anything that doesn't is r
   `DeviceColor`) are declared in `base.ts` and flow **outward** to these modules — never the
   reverse. That is what lets `system.ts` hold a value import of `@companion-module/base` for
   `splitRgb` without dragging it into the adapter chain and breaking the bench.
+- `src/signal.ts` is the response-parsing counterpart: §1.3.1.2's reply shape, its choice list, and
+  the display formatting. It knows nothing about variable names — `variables.ts` maps `InputSignal`
+  onto those — so the parsing stays usable by anything else that needs live input state.
 - Actions, feedbacks, presets, and variables are each registered from their own module via an
   `Update*(self)` function called from `ModuleInstance`. Keep that shape; `actions.ts` is by far
   the largest file and is where mode-dependent option lists are built.
+- **`presets.ts` is gated by mode for the same reason `actions.ts` is.** A preset may only reference
+  an action id that exists in the configured mode, or applying it binds a step to an action the
+  module never registered — so its mode predicates mirror `UpdateActions()` exactly, and
+  `updatePresets()` is called from `configUpdated()` as well as `init()`. Adding a mode therefore
+  means checking three places, not one: `DEVICE_MODES`/`DEVICE_MODE_CHOICES`, the `actions.ts`
+  gating, and here. In daisy-chain mode the preset list is Audio and K/M Control only.
+  Variable references in preset text use the `sequoia:` prefix — the manifest `shortname`, which
+  Companion rewrites to the user's connection label when the preset is applied.

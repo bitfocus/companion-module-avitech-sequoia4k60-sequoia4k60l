@@ -196,18 +196,31 @@ export abstract class SequoiaAdapter {
 	// Documented once for "Sequoia 4K60/4K60L", one request shape per command, so - as in section
 	// 1.3.2 - there is nothing for a subclass to branch on.
 	//
-	// None of the responses below have been captured from hardware. Section 1.3.2's `get` comments
-	// quote real captured payloads because that section was bench-tested; this one has not been, so
-	// the shapes the guide shows only as screenshots are described but not asserted, and the `get`
-	// actions log the reply verbatim rather than picking fields out of it.
+	// The `get` responses below divide by how their shape is known, and the division matters:
+	//
+	// - **Captured from hardware.** Firmware Version (1.3.1.1, see `device-info.ts`), Signal Type
+	//   (1.3.1.2, see `signal.ts`) and Custom Preset File List (1.3.1.8, see `system.ts`). These are
+	//   parsed into variables and pickers because their shape is a fact rather than a reading of a
+	//   screenshot. All three captures are from a 4K60L; the 4K60 has never answered any of them.
+	// - **Decoded from the guide's figures.** Network Info (1.3.1.3) and OSD Info (1.3.1.14), both
+	//   still logged verbatim rather than parsed. Firmware Version was in this group until a bench
+	//   capture moved it, and what that capture found is the caution for these two: the guide was
+	//   right about every key it showed and short by 19 of the 51 the device actually sends.
+	//
+	// Section 1.3.2's history is the reason for the distinction: guide-faithful and correct came
+	// apart there once already.
 	//
 	// Two of these commands (`setOutputResolution`, `setKmControl`) are also documented in sections
 	// 1.3.4 and 1.3.5 for the 4K60L specifically. They live here rather than on the 4K60L adapter
 	// because 1.3.1 documents them for both machines - see their own comments.
 
 	/**
-	 * Table 1.3.1.1. Reports the MCU / Scaler / Web / KM firmware versions. Response shown in the
-	 * guide only as a screenshot (Figure 1.3.1.1).
+	 * Table 1.3.1.1. Reports the unit's firmware versions - nine strings on a 4K60L, not the four
+	 * the prose's "MCU / Scaler / Web / KM" promises. `device-info.ts` transcribes both the guide's
+	 * figure and the 2026-08-24 hardware capture, and parses the reply into the `firmware_*`
+	 * variables.
+	 *
+	 * Also the module's reachability check - `checkConnection()` sends this and reads the reply.
 	 */
 	async getFirmwareVersion(): Promise<AvitechResponse> {
 		return this.api.sendCommand('Info', { func: 'get', type: 'device' })
@@ -311,7 +324,17 @@ export abstract class SequoiaAdapter {
 		})
 	}
 
-	/** Table 1.3.1.8. Lists saved custom preset filenames. Response shown only as Figure 1.3.1.7. */
+	/**
+	 * Table 1.3.1.8. Lists saved custom preset filenames. Response shown only as Figure 1.3.1.7.
+	 *
+	 * Captured from a 4K60L on 2026-08-19: `[]` with nothing saved, then `["TestPreset"]`, then
+	 * `["TestPreset2","TestPreset"]`. So this is a JSON array of **bare filename strings** with no
+	 * extension and no wrapping object, and an empty list is an ordinary successful read rather than
+	 * an error. A name from here feeds `loadCustomPreset()` and `deleteCustomPreset()` unchanged.
+	 *
+	 * The ordering is **newest-first**: `Alpha`, saved last, came back first, which is what rules out
+	 * descending-alphabetical. `parseCustomPresetList()` preserves that order rather than sorting.
+	 */
 	async listCustomPresets(): Promise<AvitechResponse> {
 		return this.api.sendCommand('2060', { func: 'list', type: 'custom_preset', port: SYSTEM_COMMAND_PORT })
 	}
@@ -416,7 +439,12 @@ export abstract class SequoiaAdapter {
 	 * Unlike `setWindowGeometry`, this does not read current state first. It does not have to: every
 	 * worked example in these six tables sends a partial `data` object and the unaddressed keys are
 	 * left alone, so there is no all-or-nothing payload to reconstruct and nothing to accidentally
-	 * reset. If that turns out to be false on hardware, `getOsdInfo` is the read side to build on.
+	 * reset.
+	 *
+	 * **Confirmed additive** on a 4K60L in quad-bypass mode, 2026-08-19: writing one task's keys
+	 * leaves the others as they were. This was the module's largest untested assumption, because
+	 * `setWindowGeometry` had to abandon exactly the same one. `getOsdInfo` remains the read side if
+	 * a future firmware changes it.
 	 */
 	async setOsd(data: Partial<OsdSettings>): Promise<void> {
 		await this.api.sendCommand('2060', { func: 'set', type: 'osd', data })
@@ -452,9 +480,12 @@ export abstract class SequoiaAdapter {
 	 * Table 1.3.1.24. Idle time in seconds after which the keyboard/mouse locks automatically.
 	 *
 	 * The guide's Cmd-Value row for `idle_time` is **blank** - it documents no range, no units and no
-	 * disable value. Seconds is inferred from the single example, which sends 120 and describes it as
-	 * "2 minutes"; that is the only fact available. Whether 0 disables the lock is unknown and
-	 * untested, so the action does not claim it does.
+	 * disable value. Seconds was inferred from the single example, which sends 120 and describes it
+	 * as "2 minutes", and that inference is **confirmed** on a 4K60L in quad-bypass mode, 2026-08-19.
+	 *
+	 * Still unknown: whether 0 disables the lock, and where the real upper bound is. The 0-65535
+	 * range in `actions.ts` is this module's invention, not a vendor-stated limit, so the action
+	 * still does not claim 0 means "never".
 	 */
 	async setKmIdleDetection(idleTime: number): Promise<void> {
 		await this.api.sendCommand('Info', { func: 'lock', type: 'km', idle_time: idleTime })
