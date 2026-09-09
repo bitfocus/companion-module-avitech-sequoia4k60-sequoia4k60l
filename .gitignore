@@ -11,3 +11,6 @@ DEBUG-*
 *.pdf
 # Windows Mark-of-the-Web alternate data streams, materialized as files by WSL
 *:Zone.Identifier
+
+# Working notes kept out of the repo deliberately
+/docs/http-command-applicability.md
